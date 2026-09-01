@@ -268,6 +268,49 @@ class TestParseCsv:
         assert transactions[0].external_id is None
         assert transactions[0].notes == "Gift for John"
 
+    def test_parse_csv_bank_statement_headers(self):
+        """A bank statement (HDFC) with a blank first line, padded headers,
+        Narration/Debit Amount/Credit Amount columns and 2-digit years parses
+        without any explicit column mapping."""
+        csv_content = (
+            "\r\n"
+            "  Date     ,Narration        ,Value Dat,Debit Amount ,"
+            "Credit Amount ,Chq/Ref Number   ,Closing Balance\r\n"
+            " 01/09/26  ,ACH D- GROWW     ,01/09/26 ,     8000.00 ,"
+            "        0.00 ,0000003252935145 ,     64213.54\r\n"
+            " 02/09/26  ,SALARY CREDIT    ,02/09/26 ,        0.00 ,"
+            "    50000.00 ,0000003252935146 ,    114213.54\r\n"
+        )
+        transactions = parse_csv(csv_content.encode("utf-8"))
+
+        assert len(transactions) == 2
+        assert transactions[0].description == "ACH D- GROWW"
+        assert transactions[0].date == date(2026, 9, 1)
+        assert transactions[0].type == "debit"
+        assert transactions[0].amount == Decimal("8000.00")
+        assert transactions[1].type == "credit"
+        assert transactions[1].amount == Decimal("50000.00")
+
+    def test_detect_csv_columns_skips_blank_leading_line(self):
+        """Header detection ignores a leading blank line."""
+        csv_content = "\r\n  Date  ,Narration,Debit Amount\r\n01/09/26,X,10.00\r\n"
+        assert detect_csv_columns(csv_content.encode("utf-8")) == [
+            "Date",
+            "Narration",
+            "Debit Amount",
+        ]
+
+    def test_parse_csv_prefers_amount_over_balance_column(self):
+        """A running-balance column is never mistaken for the amount."""
+        csv_content = (
+            "date,description,amount,balance\n"
+            "2026-01-10,SALARY,5000.00,64213.54\n"
+        )
+        transactions = parse_csv(csv_content.encode("utf-8"))
+        assert len(transactions) == 1
+        assert transactions[0].amount == Decimal("5000.00")
+
+
 class TestParseCsvColumnMapping:
     """Tests for customizable CSV column mapping (issue #201)."""
 

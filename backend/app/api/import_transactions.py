@@ -63,6 +63,28 @@ async def preview_import(
             )
 
     parse_error: Optional[str] = None
+
+    def parse_csv_with_options() -> tuple[list, Optional[str]]:
+        """Parse the upload as CSV, honouring the caller's mapping options.
+
+        Returns (transactions, parse_error). When the columns can't be
+        resolved but the headers are readable, this soft-fails so the UI can
+        offer the column-mapping dropdowns instead of a hard error.
+        """
+        try:
+            return import_service.parse_csv(
+                content,
+                date_format=date_format,
+                flip_amount=flip_amount,
+                inflow_column=inflow_column,
+                outflow_column=outflow_column,
+                column_mapping=parsed_mapping,
+            ), None
+        except ValueError as csv_err:
+            if not import_service.detect_csv_columns(content):
+                raise
+            return [], str(csv_err)
+
     try:
         if filename.lower().endswith('.ofx') or filename.lower().endswith('.qfx'):
             transactions = import_service.parse_ofx(content)
@@ -75,39 +97,28 @@ async def preview_import(
             detected_format = "camt"
         elif filename.lower().endswith('.csv'):
             detected_format = "csv"
-            try:
-                transactions = import_service.parse_csv(
-                    content,
-                    date_format=date_format,
-                    flip_amount=flip_amount,
-                    inflow_column=inflow_column,
-                    outflow_column=outflow_column,
-                    column_mapping=parsed_mapping,
-                )
-            except ValueError as csv_err:
-                # The CSV's columns couldn't be auto-mapped. As long as we can
-                # still read its headers, return a soft failure so the UI can
-                # show the column-mapping dropdowns instead of a hard error.
-                if not import_service.detect_csv_columns(content):
-                    raise
-                transactions = []
-                parse_error = str(csv_err)
+            transactions, parse_error = parse_csv_with_options()
         else:
-            # Try to detect format
-            try:
-                transactions = import_service.parse_ofx(content)
-                detected_format = "ofx"
-            except Exception:
+            # Try to detect format. A parser that returns no rows hasn't
+            # recognized the file — parse_qif in particular accepts any text
+            # and yields [] — so keep sniffing instead of reporting an empty
+            # import, and let CSV (with its column mapping) have the last try.
+            transactions = []
+            detected_format = "csv"
+            for fmt, parser in (
+                ("ofx", lambda: import_service.parse_ofx(content)),
+                ("qif", lambda: import_service.parse_qif(content, date_format=date_format)),
+                ("camt", lambda: import_service.parse_camt(content)),
+            ):
                 try:
-                    transactions = import_service.parse_qif(content, date_format=date_format)
-                    detected_format = "qif"
+                    parsed = parser()
                 except Exception:
-                    try:
-                        transactions = import_service.parse_camt(content)
-                        detected_format = "camt"
-                    except Exception:
-                        transactions = import_service.parse_csv(content)
-                        detected_format = "csv"
+                    continue
+                if parsed:
+                    transactions, detected_format = parsed, fmt
+                    break
+            else:
+                transactions, parse_error = parse_csv_with_options()
     except Exception as e:
         logger.error(
             "Failed to parse import file: filename=%s, size=%d bytes, "

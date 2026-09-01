@@ -48,7 +48,7 @@ async def test_preview_csv_returns_columns(client: AsyncClient, auth_headers, te
 @pytest.mark.asyncio
 async def test_preview_csv_with_column_mapping(client: AsyncClient, auth_headers, test_account):
     """A CSV with non-standard headers parses once columns are mapped."""
-    csv_content = b"transaction_date,details,value\n15/02/2026,GROCERY STORE,-80.00\n"
+    csv_content = b"col_a,col_b,col_c\n15/02/2026,GROCERY STORE,-80.00\n"
     # Without a mapping the description column can't be auto-detected: the
     # preview soft-fails (200) with a parse_error and no transactions.
     fail = await client.post(
@@ -66,9 +66,9 @@ async def test_preview_csv_with_column_mapping(client: AsyncClient, auth_headers
         headers=auth_headers,
         files={"file": ("export.csv", csv_content, "text/csv")},
         data={"column_mapping": json.dumps({
-            "date": "transaction_date",
-            "description": "details",
-            "amount": "value",
+            "date": "col_a",
+            "description": "col_b",
+            "amount": "col_c",
         })},
     )
     assert ok.status_code == 200
@@ -76,6 +76,39 @@ async def test_preview_csv_with_column_mapping(client: AsyncClient, auth_headers
     assert len(data["transactions"]) == 1
     assert data["transactions"][0]["description"] == "GROCERY STORE"
     assert data["transactions"][0]["type"] == "debit"
+
+
+@pytest.mark.asyncio
+async def test_preview_non_csv_extension_still_honours_mapping(
+    client: AsyncClient, auth_headers, test_account
+):
+    """A CSV uploaded with a non-.csv name falls through to CSV sniffing,
+    which must still apply the column mapping instead of ignoring it."""
+    csv_content = b"col_a,col_b,col_c\n15/02/2026,GROCERY STORE,-80.00\n"
+    # Unmappable headers soft-fail (200) with the headers, not a 400.
+    fail = await client.post(
+        "/api/transactions/import/preview",
+        headers=auth_headers,
+        files={"file": ("export.txt", csv_content, "text/plain")},
+    )
+    assert fail.status_code == 200
+    assert fail.json()["parse_error"]
+    assert fail.json()["csv_columns"] == ["col_a", "col_b", "col_c"]
+
+    ok = await client.post(
+        "/api/transactions/import/preview",
+        headers=auth_headers,
+        files={"file": ("export.txt", csv_content, "text/plain")},
+        data={"column_mapping": json.dumps({
+            "date": "col_a",
+            "description": "col_b",
+            "amount": "col_c",
+        })},
+    )
+    assert ok.status_code == 200
+    data = ok.json()
+    assert len(data["transactions"]) == 1
+    assert data["transactions"][0]["description"] == "GROCERY STORE"
 
 
 @pytest.mark.asyncio

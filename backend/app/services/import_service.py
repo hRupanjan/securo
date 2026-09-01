@@ -385,6 +385,21 @@ CSV_MAPPABLE_FIELDS = (
 )
 
 
+def _decode_csv_text(content: bytes) -> str:
+    """Decode CSV bytes and drop leading blank/separator-only lines.
+
+    Several bank exports (e.g. HDFC) start the file with an empty line or a
+    row of separators before the real header; csv.DictReader would otherwise
+    take that line as the header and find no columns at all.
+    """
+    text = content.decode('utf-8-sig')  # Handle BOM
+    lines = text.splitlines(keepends=True)
+    start = 0
+    while start < len(lines) and not lines[start].strip(' \t,;|*-\r\n'):
+        start += 1
+    return ''.join(lines[start:])
+
+
 def _sniff_csv_dialect(text: str):
     """Detect the CSV dialect (delimiter/quoting), falling back to comma."""
     try:
@@ -399,7 +414,7 @@ def detect_csv_columns(content: bytes) -> list[str]:
     Used by the import preview so the UI can offer accurate column-mapping
     dropdowns instead of guessing headers client-side.
     """
-    text = content.decode('utf-8-sig')  # Handle BOM
+    text = _decode_csv_text(content)
     dialect = _sniff_csv_dialect(text)
     reader = csv.DictReader(io.StringIO(text), dialect=dialect)
     return [f.strip() for f in (reader.fieldnames or []) if f and f.strip()]
@@ -426,7 +441,7 @@ def parse_csv(
     - column_mapping: explicit Securo-field -> CSV-header map. Any field
       present here overrides auto-detection; unmapped fields still auto-detect.
     """
-    text = content.decode('utf-8-sig')  # Handle BOM
+    text = _decode_csv_text(content)
     dialect = _sniff_csv_dialect(text)
     reader = csv.DictReader(io.StringIO(text), dialect=dialect)
 
@@ -434,9 +449,25 @@ def parse_csv(
     fieldnames = [f.lower().strip() if f is not None else "" for f in (reader.fieldnames or [])]
 
     # Map common column names
-    date_cols = ['date', 'data', 'dt', 'transaction_date', 'data_transacao']
-    desc_cols = ['description', 'descricao', 'desc', 'memo', 'historico', 'lancamento']
-    amount_cols = ['amount', 'valor', 'value', 'quantia']
+    date_cols = [
+        'date', 'data', 'dt', 'transaction_date', 'data_transacao',
+        'transaction date', 'txn date', 'posting date', 'booking date',
+        'date of transaction',
+    ]
+    desc_cols = [
+        'description', 'descricao', 'desc', 'memo', 'historico', 'lancamento',
+        'narration', 'particulars', 'details', 'transaction details',
+        'transaction remarks', 'remarks',
+    ]
+    amount_cols = ['amount', 'valor', 'value', 'quantia', 'transaction amount', 'amt']
+    inflow_cols = [
+        'inflow', 'credit', 'credit amount', 'deposit', 'deposit amount',
+        'money in', 'paid in', 'received', 'credito', 'cr',
+    ]
+    outflow_cols = [
+        'outflow', 'debit', 'debit amount', 'withdrawal', 'withdrawal amount',
+        'withdrawal amt', 'money out', 'paid out', 'debito', 'dr',
+    ]
     type_cols = ['type', 'tipo']
     category_cols = ['category', 'categoria']
     currency_cols = ['currency', 'moeda', 'currency_code']
@@ -445,6 +476,14 @@ def parse_csv(
     external_id_cols = [] # External ID must be mapped explicitly
     notes_cols = ['notes', 'nota', 'observacao']
 
+    # Columns that can never hold a transaction amount: running balances, and
+    # date columns (so 'Value Dat' is not matched by the 'value' candidate).
+    non_amount_cols = tuple(
+        f for f in fieldnames
+        if 'balance' in f or 'saldo' in f
+        or re.search(r'(?:^|\W)(?:date|dat|data|dt)(?:\W|$)', f)
+    )
+
     # Normalize the user-supplied column mapping (Securo field -> CSV header).
     mapping = {
         field: value.lower().strip()
@@ -452,13 +491,25 @@ def parse_csv(
         if field in CSV_MAPPABLE_FIELDS and value and value.strip()
     }
 
-    def find_col(candidates):
+    def find_col(candidates, exclude=()):
+        """Resolve a CSV header for a Securo field.
+
+        Exact match first; then a whole-word match so bank-decorated headers
+        ('Debit Amount', 'Transaction Date', 'Narration / Remarks') still
+        resolve without the user mapping them by hand.
+        """
+        usable = [f for f in fieldnames if f and f not in exclude]
         for c in candidates:
-            if c in fieldnames:
+            if c in usable:
                 return c
+        for c in candidates:
+            pattern = re.compile(rf'(?:^|\W){re.escape(c)}(?:\W|$)')
+            for f in usable:
+                if pattern.search(f):
+                    return f
         return None
 
-    def resolve_col(field, candidates):
+    def resolve_col(field, candidates, exclude=()):
         """Resolve a CSV column for a Securo field.
 
         An explicit user mapping always wins; otherwise fall back to
@@ -472,7 +523,7 @@ def parse_csv(
                     f"Available columns: {', '.join(fieldnames)}"
                 )
             return mapped
-        return find_col(candidates)
+        return find_col(candidates, exclude)
 
     date_col = resolve_col('date', date_cols)
     desc_col = resolve_col('description', desc_cols)
@@ -483,12 +534,23 @@ def parse_csv(
     outflow_col = (outflow_column or mapping.get('outflow') or '').lower().strip() or None
     use_split = bool(inflow_col and outflow_col)
 
+    auto_inflow = find_col(inflow_cols, exclude=non_amount_cols)
+    auto_outflow = find_col(
+        outflow_cols,
+        exclude=non_amount_cols + ((auto_inflow,) if auto_inflow else ()),
+    )
+
     if use_split:
         if inflow_col not in fieldnames or outflow_col not in fieldnames:
             raise ValueError(f"Inflow/outflow columns not found in CSV. Available columns: {', '.join(fieldnames)}")
         amount_col = None
     else:
-        amount_col = resolve_col('amount', amount_cols)
+        amount_exclude = non_amount_cols + tuple(c for c in (auto_inflow, auto_outflow) if c)
+        amount_col = resolve_col('amount', amount_cols, exclude=amount_exclude)
+        # No single amount column, but the bank split it into debit/credit ones.
+        if not amount_col and auto_inflow and auto_outflow:
+            inflow_col, outflow_col = auto_inflow, auto_outflow
+            use_split = True
 
     type_col = resolve_col('type', type_cols)
     category_col = resolve_col('category', category_cols)
@@ -506,14 +568,17 @@ def parse_csv(
     if not use_split and not amount_col:
         raise ValueError(
             f"Could not detect amount column. Found: {', '.join(fieldnames)}. "
-            f"Expected a column named: {', '.join(amount_cols)}"
+            f"Expected a column named: {', '.join(amount_cols)}, "
+            f"or a debit/credit column pair"
         )
 
     # Determine date formats to try
     if date_format and date_format in DATE_FORMAT_MAP:
-        date_formats = [DATE_FORMAT_MAP[date_format]]
+        fmt = DATE_FORMAT_MAP[date_format]
+        date_formats = [fmt, fmt.replace('%Y', '%y')]
     else:
         date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%m/%d/%Y', '%d.%m.%Y']
+        date_formats += [f.replace('%Y', '%y') for f in date_formats]
 
     transactions = []
     for row in reader:
@@ -521,7 +586,7 @@ def parse_csv(
         row = {k.lower().strip() if k is not None else "": v for k, v in row.items()}
 
         # Parse date
-        date_str = row[date_col].strip()
+        date_str = (row.get(date_col) or '').strip()
         txn_date = None
         for fmt in date_formats:
             try:
@@ -556,7 +621,7 @@ def parse_csv(
             else:
                 continue  # Skip rows with no amount
         else:
-            amount_str = normalize_amount(row[amount_col])
+            amount_str = normalize_amount(row.get(amount_col) or '')
 
             try:
                 amount = Decimal(amount_str)
@@ -591,7 +656,7 @@ def parse_csv(
         txn_notes = row[notes_col].strip() if notes_col and row.get(notes_col) else None
 
         transactions.append(TransactionImport(
-            description=row[desc_col].strip(),
+            description=(row.get(desc_col) or '').strip(),
             amount=abs(amount),
             date=txn_date,
             type=txn_type,
